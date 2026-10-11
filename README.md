@@ -1,6 +1,18 @@
 
 # ⏰ AI Powered Timetable Scheduler
 
+## 🌐 Live Web Demo
+
+The hosted browser demo is configured through `render.yaml`; its source is kept
+separately in [`web-demo/`](./web-demo/), so this desktop app remains unchanged.
+Deploy it from Render using **New → Blueprint** and this GitHub repository.
+Render will prompt for `TIMETABLE_ADMIN_PASSWORD`; choose a private password of
+at least 12 characters. The session-signing secret is generated automatically.
+
+The demo uses fictional sample data and an isolated database. Do not enter real
+student or staff information. Render's free filesystem can reset data after a
+restart or redeploy. Never upload database files, API keys, or passwords.
+
 ## 📌 Project Overview
 The AI Powered Timetable Scheduler is a web-based application
 that automatically generates class timetables without any 
