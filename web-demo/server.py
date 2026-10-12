@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
+import smtplib
 import sqlite3
+import ssl
 import sys
 import time
+import zipfile
+from collections import defaultdict
 from contextlib import closing
+from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
+from io import BytesIO
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
-from ai_service import AIService, generate_clash_free_timetable, is_timetable_generation_request
+from ai_service import (
+    AIService,
+    generate_clash_free_timetable,
+    is_timetable_generation_request,
+)
+from college_scheduler import (
+    ScheduleValidationError,
+    WEEKDAYS,
+    generate_college_timetable,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,6 +50,30 @@ SESSION_SECRET = os.environ.get("TIMETABLE_SESSION_SECRET", "")
 COOKIE_SECURE = os.environ.get("TIMETABLE_COOKIE_SECURE", "1").strip() != "0"
 SESSION_LIFETIME_SECONDS = 12 * 60 * 60
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+LIVE_MESSAGING_ENABLED = os.environ.get("TIMETABLE_ENABLE_LIVE_MESSAGING", "").strip().casefold() in {
+    "1",
+    "true",
+    "yes",
+}
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
+ALLOWED_WHATSAPP_RECIPIENTS = {
+    number.strip()
+    for number in os.environ.get("TIMETABLE_ALLOWED_WHATSAPP_RECIPIENTS", "").split(",")
+    if number.strip()
+}
+SMTP_HOST = os.environ.get("TIMETABLE_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("TIMETABLE_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("TIMETABLE_SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("TIMETABLE_SMTP_PASSWORD", "")
+ALLOWED_EMAIL_RECIPIENTS = {
+    address.strip().casefold()
+    for address in os.environ.get("TIMETABLE_ALLOWED_EMAIL_RECIPIENTS", "").split(",")
+    if address.strip()
+}
+MESSAGE_SEND_ATTEMPTS: dict[str, list[float]] = {}
+EXPORT_RATE_LIMIT: dict[str, list[float]] = {}
 ASSET_TABLES = {
     "teachers": "teachers",
     "subjects": "subjects",
@@ -43,7 +86,13 @@ AI_ENABLED = os.environ.get("TIMETABLE_ENABLE_CLOUD_AI", "").strip().casefold() 
     "true",
     "yes",
 }
-AI = AIService.from_env() if AI_ENABLED else AIService.from_env({})
+AI = AIService.from_env() if AI_ENABLED else AIService.from_env({"AI_PROVIDER": "offline"})
+EXPANDED_DEMO_DATA_KEY = "expanded_demo_data_v1"
+SEED_DEMO_DATA = os.environ.get("TIMETABLE_SEED_DEMO_DATA", "1").strip().casefold() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def open_database() -> sqlite3.Connection:
@@ -104,7 +153,52 @@ def initialize_database() -> None:
                 subject TEXT,
                 teacher TEXT,
                 room TEXT,
+                department TEXT DEFAULT '',
+                academic_year TEXT DEFAULT '',
+                semester TEXT DEFAULT '',
+                section TEXT DEFAULT '',
+                subject_code TEXT DEFAULT '',
+                start_time TEXT DEFAULT '',
+                end_time TEXT DEFAULT '',
+                entry_type TEXT DEFAULT 'lecture',
+                practical_session TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS college_class_details (
+                class_name TEXT PRIMARY KEY,
+                department TEXT NOT NULL,
+                academic_year TEXT NOT NULL,
+                semester TEXT NOT NULL,
+                section TEXT NOT NULL,
+                capacity INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS college_subject_details (
+                subject_name TEXT PRIMARY KEY,
+                subject_code TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS college_requirements (
+                class_name TEXT NOT NULL,
+                subject_name TEXT NOT NULL,
+                teacher_name TEXT NOT NULL DEFAULT '',
+                lecture_count INTEGER NOT NULL,
+                practical_count INTEGER NOT NULL,
+                practical_block_size INTEGER NOT NULL DEFAULT 2,
+                requires_lab INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (class_name, subject_name)
+            );
+            CREATE TABLE IF NOT EXISTS college_room_details (
+                room_name TEXT PRIMARY KEY,
+                room_type TEXT NOT NULL,
+                capacity INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS teacher_unavailability (
+                teacher_name TEXT NOT NULL,
+                day TEXT NOT NULL,
+                period INTEGER NOT NULL,
+                PRIMARY KEY (teacher_name, day, period)
+            );
+            CREATE TABLE IF NOT EXISTS teacher_availability_settings (
+                teacher_name TEXT PRIMARY KEY
             );
             CREATE TABLE IF NOT EXISTS feedback (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,8 +214,34 @@ def initialize_database() -> None:
                 content TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
+        timetable_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(timetable_entries)")
+        }
+        for column, declaration in {
+            "department": "TEXT DEFAULT ''",
+            "academic_year": "TEXT DEFAULT ''",
+            "semester": "TEXT DEFAULT ''",
+            "section": "TEXT DEFAULT ''",
+            "subject_code": "TEXT DEFAULT ''",
+            "start_time": "TEXT DEFAULT ''",
+            "end_time": "TEXT DEFAULT ''",
+            "entry_type": "TEXT DEFAULT 'lecture'",
+            "practical_session": "TEXT DEFAULT ''",
+        }.items():
+            if column not in timetable_columns:
+                connection.execute(
+                    f"ALTER TABLE timetable_entries ADD COLUMN {column} {declaration}"
+                )
+        if not SEED_DEMO_DATA:
+            connection.commit()
+            return
         if connection.execute("SELECT COUNT(*) FROM teachers").fetchone()[0] == 0:
             teachers = [
                 ("Asha Demo", "asha@example.invalid", ""),
@@ -180,7 +300,226 @@ def initialize_database() -> None:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 rows,
             )
+        if not connection.execute(
+            "SELECT 1 FROM app_metadata WHERE key = ?",
+            (EXPANDED_DEMO_DATA_KEY,),
+        ).fetchone():
+            connection.executemany(
+                "INSERT OR IGNORE INTO teachers (name, email, phone) VALUES (?, ?, ?)",
+                [
+                    ("Kavita Rao", "kavita@example.invalid", ""),
+                    ("Arjun Mehta", "arjun@example.invalid", ""),
+                    ("Nisha Kapoor", "nisha@example.invalid", ""),
+                ],
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO subjects (name) VALUES (?)",
+                [
+                    ("Computer Science",),
+                    ("Hindi",),
+                    ("Social Studies",),
+                ],
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO classes (name) VALUES (?)",
+                [("Class 8-A",), ("Class 10-A",)],
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO classrooms (name) VALUES (?)",
+                [("Room 103",), ("Room 104",)],
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO lab_rooms (name) VALUES (?)",
+                [("Computer Lab",), ("Science Lab",)],
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO teacher_expertise (teacher, subject) VALUES (?, ?)",
+                [
+                    ("Kavita Rao", "Mathematics"),
+                    ("Kavita Rao", "Computer Science"),
+                    ("Kavita Rao", "Hindi"),
+                    ("Arjun Mehta", "Science"),
+                    ("Arjun Mehta", "Social Studies"),
+                    ("Arjun Mehta", "Computer Science"),
+                    ("Nisha Kapoor", "English"),
+                    ("Nisha Kapoor", "Hindi"),
+                    ("Nisha Kapoor", "Social Studies"),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO app_metadata (key, value) VALUES (?, ?)",
+                (EXPANDED_DEMO_DATA_KEY, "1"),
+            )
         connection.commit()
+
+
+def _active_names(connection: sqlite3.Connection, table: str) -> list[str]:
+    if table not in {"classes", "subjects", "teachers", "classrooms", "lab_rooms"}:
+        raise ValueError("Unsupported timetable asset type.")
+    return [
+        row["name"]
+        for row in connection.execute(
+            f"SELECT name FROM {table} WHERE is_deleted = 0 ORDER BY id"
+        )
+    ]
+
+
+def invalidate_schedule_validation(connection: sqlite3.Connection) -> None:
+    connection.executemany(
+        "DELETE FROM app_metadata WHERE key = ?",
+        (
+            (key,)
+            for key in (
+            "college_schedule_validated",
+            "college_schedule_days",
+            "college_schedule_validation",
+            )
+        ),
+    )
+
+
+def generate_configured_week(
+    connection: sqlite3.Connection,
+    periods_per_day: int,
+    start_time: str,
+    period_minutes: int,
+) -> dict:
+    active_classes = set(_active_names(connection, "classes"))
+    active_subjects = set(_active_names(connection, "subjects"))
+    active_teachers = _active_names(connection, "teachers")
+    active_classrooms = set(_active_names(connection, "classrooms"))
+    active_laboratories = set(_active_names(connection, "lab_rooms"))
+    configured_classes = {
+        row["class_name"]: dict(row)
+        for row in connection.execute(
+            "SELECT class_name, department, academic_year, semester, section, capacity "
+            "FROM college_class_details ORDER BY class_name"
+        )
+    }
+    classes = [
+        configured_classes.get(
+            name,
+            {
+                "class_name": name,
+                "department": "",
+                "academic_year": "",
+                "semester": "",
+                "section": "",
+                "capacity": None,
+            },
+        )
+        for name in sorted(active_classes)
+    ]
+    configured_subjects = {
+        row["subject_name"]: dict(row)
+        for row in connection.execute(
+            "SELECT subject_name, subject_code FROM college_subject_details"
+        )
+    }
+    subjects = {
+        name: configured_subjects.get(
+            name,
+            {"subject_name": name, "subject_code": ""},
+        )
+        for name in sorted(active_subjects)
+    }
+    requirements = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT class_name, subject_name, teacher_name, lecture_count, "
+            "practical_count, practical_block_size, requires_lab "
+            "FROM college_requirements ORDER BY class_name, subject_name"
+        )
+    ]
+    configured_rooms = {
+        row["room_name"]: dict(row)
+        for row in connection.execute(
+            "SELECT room_name, room_type, capacity FROM college_room_details"
+        )
+    }
+    rooms = []
+    for room_type, names in (
+        ("classroom", active_classrooms),
+        ("laboratory", active_laboratories),
+    ):
+        for name in sorted(names):
+            details = configured_rooms.get(name)
+            rooms.append({
+                "room_name": name,
+                "room_type": details["room_type"] if details else room_type,
+                "capacity": details["capacity"] if details else None,
+            })
+    expertise: dict[str, list[str]] = defaultdict(list)
+    for row in connection.execute(
+        "SELECT teacher, subject FROM teacher_expertise ORDER BY id"
+    ):
+        if row["teacher"] in active_teachers and row["subject"] in active_subjects:
+            expertise[row["teacher"]].append(row["subject"])
+    unavailable: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    for row in connection.execute(
+        "SELECT teacher_name, day, period FROM teacher_unavailability"
+    ):
+        if row["teacher_name"] in active_teachers:
+            unavailable[row["teacher_name"]].add((row["day"], row["period"]))
+    availability_configured = {
+        row["teacher_name"]
+        for row in connection.execute("SELECT teacher_name FROM teacher_availability_settings")
+        if row["teacher_name"] in active_teachers
+    }
+
+    result = generate_college_timetable(
+        classes=classes,
+        subjects=subjects,
+        teachers=active_teachers,
+        expertise=dict(expertise),
+        rooms=rooms,
+        requirements=requirements,
+        unavailable=dict(unavailable),
+        availability_configured=availability_configured,
+        periods_per_day=periods_per_day,
+        start_time=start_time,
+        period_minutes=period_minutes,
+    )
+    connection.execute("DELETE FROM timetable_entries")
+    connection.executemany(
+        "INSERT INTO timetable_entries "
+        "(class_name, day, period, subject, teacher, room, department, academic_year, "
+        "semester, section, subject_code, start_time, end_time, entry_type, practical_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                entry["class_name"],
+                entry["day"],
+                entry["period"],
+                entry["subject"],
+                entry["teacher"],
+                entry["room"],
+                entry["department"],
+                entry["academic_year"],
+                entry["semester"],
+                entry["section"],
+                entry["subject_code"],
+                entry["start_time"],
+                entry["end_time"],
+                entry["entry_type"],
+                entry["practical_session"],
+            )
+            for entry in result["entries"]
+        ],
+    )
+    connection.execute(
+        "INSERT INTO app_metadata (key, value) VALUES ('college_schedule_validated', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    )
+    connection.executemany(
+        "INSERT INTO app_metadata (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (
+            ("college_schedule_days", json.dumps(WEEKDAYS)),
+            ("college_schedule_validation", json.dumps(result["validation"])),
+        ),
+    )
+    return result
 
 
 def fetch_state(connection: sqlite3.Connection) -> dict:
@@ -204,18 +543,91 @@ def fetch_state(connection: sqlite3.Connection) -> dict:
     ):
         expertise.setdefault(row["teacher"], []).append(row["subject"])
 
-    timetable: dict[str, dict[str, dict[int, dict[str, str]]]] = {}
+    class_details = {
+        row["class_name"]: dict(row)
+        for row in connection.execute(
+            "SELECT class_name, department, academic_year, semester, section, capacity "
+            "FROM college_class_details ORDER BY class_name"
+        )
+    }
+    subject_details = {
+        row["subject_name"]: dict(row)
+        for row in connection.execute(
+            "SELECT subject_name, subject_code FROM college_subject_details "
+            "ORDER BY subject_name"
+        )
+    }
+    requirements = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT class_name, subject_name, teacher_name, lecture_count, "
+            "practical_count, practical_block_size, requires_lab "
+            "FROM college_requirements ORDER BY class_name, subject_name"
+        )
+    ]
+    room_details = {
+        "classroom": {
+            name: {"room_name": name, "room_type": "classroom", "capacity": None}
+            for name in asset_names("classrooms")
+        },
+        "laboratory": {
+            name: {"room_name": name, "room_type": "laboratory", "capacity": None}
+            for name in asset_names("lab_rooms")
+        },
+    }
     for row in connection.execute(
-        "SELECT class_name, day, period, subject, teacher, room "
-        "FROM timetable_entries ORDER BY day, class_name, period"
+        "SELECT room_name, room_type, capacity FROM college_room_details"
+    ):
+        if row["room_name"] in room_details.get(row["room_type"], {}):
+            room_details[row["room_type"]][row["room_name"]] = dict(row)
+    unavailable: dict[str, list[dict]] = {}
+    for row in connection.execute(
+        "SELECT teacher_name, day, period FROM teacher_unavailability "
+        "ORDER BY teacher_name, day, period"
+    ):
+        unavailable.setdefault(row["teacher_name"], []).append(
+            {"day": row["day"], "period": row["period"]}
+        )
+    availability_configured = [
+        row["teacher_name"]
+        for row in connection.execute(
+            "SELECT teacher_name FROM teacher_availability_settings ORDER BY teacher_name"
+        )
+    ]
+
+    timetable: dict[str, dict[str, dict[int, dict[str, str]]]] = {}
+    schedule_marker = connection.execute(
+        "SELECT value FROM app_metadata WHERE key = 'college_schedule_validated'"
+    ).fetchone()
+    if schedule_marker and schedule_marker["value"] == "1":
+        timetable = {
+            day: {name: {} for name in _active_names(connection, "classes")}
+            for day in WEEKDAYS
+        }
+    for row in connection.execute(
+        "SELECT class_name, day, period, subject, teacher, room, department, "
+        "academic_year, semester, section, subject_code, start_time, end_time, "
+        "entry_type, practical_session "
+        "FROM timetable_entries ORDER BY id"
     ):
         timetable.setdefault(row["day"], {}).setdefault(row["class_name"], {})[
             row["period"]
-        ] = {
-            "subject": row["subject"],
-            "teacher": row["teacher"],
-            "room": row["room"],
-        }
+        ] = dict(row)
+
+    weekly_entries = [
+        entry
+        for day in WEEKDAYS
+        for classes_for_day in [timetable.get(day, {})]
+        for periods_for_class in classes_for_day.values()
+        for _, entry in sorted(periods_for_class.items())
+    ]
+    validation_row = connection.execute(
+        "SELECT value FROM app_metadata WHERE key = 'college_schedule_validation'"
+    ).fetchone()
+    try:
+        schedule_validation = json.loads(validation_row["value"]) if validation_row else None
+    except json.JSONDecodeError:
+        schedule_validation = None
 
     history = [
         dict(row)
@@ -247,9 +659,22 @@ def fetch_state(connection: sqlite3.Connection) -> dict:
         "classes": asset_names("classes"),
         "classrooms": asset_names("classrooms"),
         "labs": asset_names("lab_rooms"),
+        "class_details": class_details,
+        "subject_details": subject_details,
+        "requirements": requirements,
+        "room_details": [
+            room
+            for room_type in ("classroom", "laboratory")
+            for room in room_details[room_type].values()
+        ],
+        "teacher_unavailability": unavailable,
+        "teacher_availability_configured": availability_configured,
         "teacher_expertise": expertise,
         "generated_timetable": timetable,
-        "days": list(timetable),
+        "weekly_entries": weekly_entries,
+        "college_schedule_validated": bool(schedule_marker and schedule_marker["value"] == "1"),
+        "schedule_validation": schedule_validation,
+        "days": [day for day in WEEKDAYS if day in timetable],
         "history": history,
         "feedback": feedback,
         "ai_history": ai_history,
@@ -258,7 +683,204 @@ def fetch_state(connection: sqlite3.Connection) -> dict:
         "role": "admin",
         "ai_provider": AI.provider,
         "ai_configured": AI.configured,
+        "messaging": {
+            "live_enabled": LIVE_MESSAGING_ENABLED,
+            "whatsapp_ready": bool(
+                LIVE_MESSAGING_ENABLED
+                and TWILIO_ACCOUNT_SID
+                and TWILIO_AUTH_TOKEN
+                and TWILIO_WHATSAPP_FROM
+                and ALLOWED_WHATSAPP_RECIPIENTS
+            ),
+            "email_ready": bool(
+                LIVE_MESSAGING_ENABLED
+                and SMTP_HOST
+                and SMTP_USER
+                and SMTP_PASSWORD
+                and ALLOWED_EMAIL_RECIPIENTS
+            ),
+        },
     }
+
+
+def excel_workbook(state: dict) -> bytes:
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    relationships = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ElementTree.register_namespace("", namespace)
+    ElementTree.register_namespace("r", relationships)
+    sheet = ElementTree.Element(f"{{{namespace}}}worksheet")
+    sheet_data = ElementTree.SubElement(sheet, f"{{{namespace}}}sheetData")
+    headers = (
+        "Day", "Department", "Academic Year", "Semester", "Class", "Section",
+        "Subject", "Subject Code", "Teacher", "Start Time", "End Time",
+        "Type", "Room / Lab", "Period",
+    )
+    rows = [headers]
+    for item in state.get("weekly_entries", []):
+        rows.append(tuple(item.get(key, "") for key in (
+            "day", "department", "academic_year", "semester", "class_name",
+            "section", "subject", "subject_code", "teacher", "start_time",
+            "end_time", "entry_type", "room", "period",
+        )))
+
+    for row_number, values in enumerate(rows, start=1):
+        row = ElementTree.SubElement(
+            sheet_data, f"{{{namespace}}}row", {"r": str(row_number)}
+        )
+        for column_number, value in enumerate(values):
+            column_name = chr(ord("A") + column_number)
+            cell = ElementTree.SubElement(
+                row,
+                f"{{{namespace}}}c",
+                {"r": f"{column_name}{row_number}"},
+            )
+            if row_number > 1 and column_number == 13:
+                cell.set("t", "n")
+                ElementTree.SubElement(cell, f"{{{namespace}}}v").text = str(value)
+            else:
+                cell.set("t", "inlineStr")
+                inline = ElementTree.SubElement(cell, f"{{{namespace}}}is")
+                ElementTree.SubElement(inline, f"{{{namespace}}}t").text = str(value)
+
+    workbook = ElementTree.Element(f"{{{namespace}}}workbook")
+    sheets = ElementTree.SubElement(workbook, f"{{{namespace}}}sheets")
+    ElementTree.SubElement(
+        sheets,
+        f"{{{namespace}}}sheet",
+        {"name": "Timetable", "sheetId": "1", f"{{{relationships}}}id": "rId1"},
+    )
+    content_types = ElementTree.Element(
+        "Types",
+        xmlns="http://schemas.openxmlformats.org/package/2006/content-types",
+    )
+    ElementTree.SubElement(
+        content_types,
+        "Default",
+        {"Extension": "rels", "ContentType": "application/vnd.openxmlformats-package.relationships+xml"},
+    )
+    ElementTree.SubElement(
+        content_types,
+        "Default",
+        {"Extension": "xml", "ContentType": "application/xml"},
+    )
+    ElementTree.SubElement(
+        content_types,
+        "Override",
+        {"PartName": "/xl/workbook.xml", "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"},
+    )
+    ElementTree.SubElement(
+        content_types,
+        "Override",
+        {"PartName": "/xl/worksheets/sheet1.xml", "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"},
+    )
+    package_relationships = ElementTree.Element(
+        "Relationships",
+        xmlns="http://schemas.openxmlformats.org/package/2006/relationships",
+    )
+    ElementTree.SubElement(
+        package_relationships,
+        "Relationship",
+        {
+            "Id": "rId1",
+            "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+            "Target": "xl/workbook.xml",
+        },
+    )
+    workbook_relationships = ElementTree.Element(
+        "Relationships",
+        xmlns="http://schemas.openxmlformats.org/package/2006/relationships",
+    )
+    ElementTree.SubElement(
+        workbook_relationships,
+        "Relationship",
+        {
+            "Id": "rId1",
+            "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+            "Target": "worksheets/sheet1.xml",
+        },
+    )
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", ElementTree.tostring(content_types, encoding="utf-8", xml_declaration=True))
+        archive.writestr("_rels/.rels", ElementTree.tostring(package_relationships, encoding="utf-8", xml_declaration=True))
+        archive.writestr("xl/workbook.xml", ElementTree.tostring(workbook, encoding="utf-8", xml_declaration=True))
+        archive.writestr("xl/_rels/workbook.xml.rels", ElementTree.tostring(workbook_relationships, encoding="utf-8", xml_declaration=True))
+        archive.writestr("xl/worksheets/sheet1.xml", ElementTree.tostring(sheet, encoding="utf-8", xml_declaration=True))
+    return output.getvalue()
+
+
+def timetable_pdf(timetable: dict) -> bytes:
+    lines = ["Timetable Scheduler Pro"]
+    for day in WEEKDAYS:
+        classes = timetable.get(day, {})
+        lines.append("")
+        lines.append(day)
+        for class_name, periods in classes.items():
+            for period, item in sorted(periods.items()):
+                lines.append(
+                    f"{item.get('department', '')} {item.get('academic_year', '')} "
+                    f"Sem {item.get('semester', '')} {class_name}-{item.get('section', '')} | "
+                    f"{item.get('start_time', '')}-{item.get('end_time', '')} P{period} | "
+                    f"{item['subject']} ({item.get('subject_code', '')}) | "
+                    f"{item.get('entry_type', 'lecture')} | "
+                    f"{item['teacher']} | {item['room']}"
+                )
+
+    wrapped_lines = []
+    for line in lines:
+        while len(line) > 88:
+            split_at = line.rfind(" ", 0, 88)
+            if split_at < 1:
+                split_at = 88
+            wrapped_lines.append(line[:split_at])
+            line = line[split_at:].lstrip()
+        wrapped_lines.append(line)
+    chunks = [wrapped_lines[index:index + 48] for index in range(0, len(wrapped_lines), 48)] or [["No timetable entries."]]
+
+    objects: list[bytes] = []
+    page_ids = []
+    for page_index, chunk in enumerate(chunks):
+        page_id = 4 + page_index * 2
+        content_id = page_id + 1
+        page_ids.append(page_id)
+        commands = ["BT", "/F1 10 Tf", "50 790 Td", "14 TL"]
+        for index, line in enumerate(chunk):
+            if index:
+                commands.append("T*")
+            safe_line = line.encode("cp1252", "replace").decode("cp1252")
+            escaped = safe_line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            commands.append(f"({escaped}) Tj")
+        commands.append("ET")
+        content = "\n".join(commands).encode("cp1252", "replace")
+        objects.extend(
+            [
+                f"{page_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>\nendobj\n".encode("ascii"),
+                f"{content_id} 0 obj\n<< /Length {len(content)} >>\nstream\n".encode("ascii")
+                + content
+                + b"\nendstream\nendobj\n",
+            ]
+        )
+    pages = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+    base_objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        f"2 0 obj\n<< /Type /Pages /Kids [{pages}] /Count {len(page_ids)} >>\nendobj\n".encode("ascii"),
+        b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n",
+    ]
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for entry in base_objects + objects:
+        offsets.append(len(output))
+        output.extend(entry)
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(output)
 
 
 class PreviewHandler(SimpleHTTPRequestHandler):
@@ -388,7 +1010,32 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
             return
+        if path == "/api/export.pdf":
+            if not self.check_export_rate_limit():
+                return
+            try:
+                with closing(open_database()) as connection:
+                    timetable = fetch_state(connection)["generated_timetable"]
+                pdf = timetable_pdf(timetable)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="timetable-scheduler.pdf"',
+                )
+                self.send_header("Content-Length", str(len(pdf)))
+                self.end_headers()
+                self.wfile.write(pdf)
+            except (sqlite3.Error, OSError) as exc:
+                print(f"Could not export timetable PDF: {exc}", file=sys.stderr)
+                self.respond_json(
+                    {"error": "Could not export the timetable PDF."},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return
         if path == "/api/backup":
+            if not self.check_export_rate_limit():
+                return
             try:
                 with closing(open_database()) as connection:
                     backup = json.dumps(
@@ -410,6 +1057,31 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
             return
+        if path == "/api/export.xlsx":
+            if not self.check_export_rate_limit():
+                return
+            try:
+                with closing(open_database()) as connection:
+                    workbook = excel_workbook(fetch_state(connection))
+                self.send_response(HTTPStatus.OK)
+                self.send_header(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="timetable-scheduler.xlsx"',
+                )
+                self.send_header("Content-Length", str(len(workbook)))
+                self.end_headers()
+                self.wfile.write(workbook)
+            except (sqlite3.Error, ElementTree.ParseError, OSError) as exc:
+                print(f"Could not export timetable Excel workbook: {exc}", file=sys.stderr)
+                self.respond_json(
+                    {"error": "Could not export the timetable workbook."},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return
         if path.startswith("/api/"):
             self.respond_json({"error": "API route not found."}, HTTPStatus.NOT_FOUND)
             return
@@ -421,6 +1093,18 @@ class PreviewHandler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/logout":
             self.respond_json({"ok": True}, cookie=self.clear_session_cookie())
+            return
+        if path in {"/api/messaging/whatsapp", "/api/messaging/email"}:
+            try:
+                if not self.require_authenticated():
+                    return
+                data = self.read_json()
+                if path.endswith("/whatsapp"):
+                    self.send_whatsapp_message(data)
+                else:
+                    self.send_email_message(data)
+            except ValueError as exc:
+                self.respond_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         try:
             data = self.read_json()
@@ -435,6 +1119,11 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                         connection, path, data
                     )
             self.respond_json(response)
+        except ScheduleValidationError as exc:
+            self.respond_json(
+                {"error": str(exc), "validation": exc.diagnostics},
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
         except ValueError as exc:
             self.respond_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except sqlite3.IntegrityError:
@@ -492,7 +1181,334 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             cookie=self.make_session_cookie(),
         )
 
+    def check_message_rate_limit(self) -> bool:
+        now = time.time()
+        address = self.client_address[0]
+        attempts = [
+            timestamp
+            for timestamp in MESSAGE_SEND_ATTEMPTS.get(address, [])
+            if now - timestamp < 300
+        ]
+        if len(attempts) >= 5:
+            MESSAGE_SEND_ATTEMPTS[address] = attempts
+            self.respond_json(
+                {"error": "Too many message requests. Wait five minutes and try again."},
+                HTTPStatus.TOO_MANY_REQUESTS,
+            )
+            return False
+        attempts.append(now)
+        MESSAGE_SEND_ATTEMPTS[address] = attempts
+        return True
+
+    def check_export_rate_limit(self) -> bool:
+        now = time.time()
+        address = self.client_address[0]
+        attempts = [
+            timestamp
+            for timestamp in EXPORT_RATE_LIMIT.get(address, [])
+            if now - timestamp < 60
+        ]
+        if len(attempts) >= 10:
+            EXPORT_RATE_LIMIT[address] = attempts
+            self.respond_json(
+                {"error": "Too many exports. Wait one minute and try again."},
+                HTTPStatus.TOO_MANY_REQUESTS,
+            )
+            return False
+        attempts.append(now)
+        EXPORT_RATE_LIMIT[address] = attempts
+        return True
+
+    def send_whatsapp_message(self, data: dict) -> None:
+        if not LIVE_MESSAGING_ENABLED:
+            self.respond_json(
+                {"error": "Live WhatsApp sending is disabled. This demo only supports previews."},
+                HTTPStatus.FORBIDDEN,
+            )
+            return
+        if not self.check_message_rate_limit():
+            return
+        recipient = data.get("phone")
+        message = data.get("message")
+        if (
+            not isinstance(recipient, str)
+            or recipient not in ALLOWED_WHATSAPP_RECIPIENTS
+            or not isinstance(message, str)
+            or not message.strip()
+            or len(message) > 2000
+        ):
+            self.respond_json(
+                {"error": "Use an authorized recipient and a message up to 2000 characters."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_FROM:
+            self.respond_json(
+                {"error": "WhatsApp sending is not configured on the server."},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        form = urlencode(
+            {
+                "From": f"whatsapp:{TWILIO_WHATSAPP_FROM}",
+                "To": f"whatsapp:{recipient}",
+                "Body": message.strip(),
+            }
+        ).encode("utf-8")
+        credentials = base64.b64encode(
+            f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")
+        ).decode("ascii")
+        request = Request(
+            f"https://api.twilio.com/2010-04-01/Accounts/{quote(TWILIO_ACCOUNT_SID, safe='')}/Messages.json",
+            data=form,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            detail = exc.read(1024).decode("utf-8", "replace")
+            print(f"Twilio request failed ({exc.code}): {detail}", file=sys.stderr)
+            self.respond_json(
+                {"error": "WhatsApp provider rejected the request. Check server credentials and recipient authorization."},
+                HTTPStatus.BAD_GATEWAY,
+            )
+            return
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            print(f"Could not send WhatsApp message: {exc}", file=sys.stderr)
+            self.respond_json(
+                {"error": "Could not reach the WhatsApp provider."},
+                HTTPStatus.BAD_GATEWAY,
+            )
+            return
+        self.respond_json({"ok": True, "message_id": result.get("sid", "")})
+
+    def send_email_message(self, data: dict) -> None:
+        if not LIVE_MESSAGING_ENABLED:
+            self.respond_json(
+                {"error": "Live email sending is disabled. This demo only supports previews."},
+                HTTPStatus.FORBIDDEN,
+            )
+            return
+        if not self.check_message_rate_limit():
+            return
+        recipient = data.get("email")
+        subject = data.get("subject")
+        message_text = data.get("message")
+        if (
+            not isinstance(recipient, str)
+            or recipient.casefold() not in ALLOWED_EMAIL_RECIPIENTS
+            or not isinstance(subject, str)
+            or not subject.strip()
+            or len(subject) > 200
+            or any(character in subject for character in "\r\n")
+            or not isinstance(message_text, str)
+            or not message_text.strip()
+            or len(message_text) > 2000
+        ):
+            self.respond_json(
+                {"error": "Use an authorized email recipient, valid subject, and message up to 2000 characters."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+            self.respond_json(
+                {"error": "Email sending is not configured on the server."},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        email = EmailMessage()
+        email["From"] = SMTP_USER
+        email["To"] = recipient
+        email["Subject"] = subject.strip()
+        email.set_content(message_text.strip())
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as client:
+                client.starttls(context=ssl.create_default_context())
+                client.login(SMTP_USER, SMTP_PASSWORD)
+                client.send_message(email)
+        except (OSError, smtplib.SMTPException, ssl.SSLError) as exc:
+            print(f"Could not send email: {exc}", file=sys.stderr)
+            self.respond_json(
+                {"error": "Could not send email. Check server settings and provider status."},
+                HTTPStatus.BAD_GATEWAY,
+            )
+            return
+        self.respond_json({"ok": True})
+
     def handle_post(self, connection: sqlite3.Connection, path: str, data: dict) -> dict:
+        if path == "/api/college-setup":
+            kind = data.get("kind")
+            if kind == "class":
+                class_name = data.get("class_name")
+                text_fields = ("department", "academic_year", "semester", "section")
+                if not isinstance(class_name, str) or class_name not in _active_names(connection, "classes"):
+                    raise ValueError("Choose an active class or section.")
+                values = [data.get(field) for field in text_fields]
+                if any(
+                    not isinstance(value, str) or not value.strip() or len(value.strip()) > 120
+                    for value in values
+                ):
+                    raise ValueError("Department, academic year, semester, and section are required.")
+                capacity = data.get("capacity")
+                if isinstance(capacity, bool) or not isinstance(capacity, int) or not 1 <= capacity <= 5000:
+                    raise ValueError("Class capacity must be between 1 and 5000.")
+                connection.execute(
+                    "INSERT INTO college_class_details "
+                    "(class_name, department, academic_year, semester, section, capacity) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(class_name) DO UPDATE SET department=excluded.department, "
+                    "academic_year=excluded.academic_year, semester=excluded.semester, "
+                    "section=excluded.section, capacity=excluded.capacity",
+                    (class_name, *(value.strip() for value in values), capacity),
+                )
+                invalidate_schedule_validation(connection)
+                return {"ok": True}
+
+            if kind == "subject":
+                subject_name = data.get("subject_name")
+                subject_code = data.get("subject_code")
+                if not isinstance(subject_name, str) or subject_name not in _active_names(connection, "subjects"):
+                    raise ValueError("Choose an active subject.")
+                if (
+                    not isinstance(subject_code, str)
+                    or not subject_code.strip()
+                    or len(subject_code.strip()) > 40
+                ):
+                    raise ValueError("Enter the official subject code (max 40 characters).")
+                connection.execute(
+                    "INSERT INTO college_subject_details (subject_name, subject_code) "
+                    "VALUES (?, ?) ON CONFLICT(subject_name) DO UPDATE SET "
+                    "subject_code=excluded.subject_code",
+                    (subject_name, subject_code.strip()),
+                )
+                invalidate_schedule_validation(connection)
+                return {"ok": True}
+
+            if kind == "room":
+                room_name = data.get("room_name")
+                room_type = data.get("room_type")
+                allowed = {
+                    "classroom": _active_names(connection, "classrooms"),
+                    "laboratory": _active_names(connection, "lab_rooms"),
+                }
+                if room_type not in allowed or not isinstance(room_name, str) or room_name not in allowed[room_type]:
+                    raise ValueError("Choose an active classroom or laboratory.")
+                capacity = data.get("capacity")
+                if isinstance(capacity, bool) or not isinstance(capacity, int) or not 1 <= capacity <= 5000:
+                    raise ValueError("Room capacity must be between 1 and 5000.")
+                connection.execute(
+                    "INSERT INTO college_room_details (room_name, room_type, capacity) "
+                    "VALUES (?, ?, ?) ON CONFLICT(room_name) DO UPDATE SET "
+                    "room_type=excluded.room_type, capacity=excluded.capacity",
+                    (room_name, room_type, capacity),
+                )
+                invalidate_schedule_validation(connection)
+                return {"ok": True}
+
+            if kind == "requirement":
+                class_name = data.get("class_name")
+                subject_name = data.get("subject_name")
+                teacher_name = data.get("teacher_name", "")
+                if not isinstance(class_name, str) or class_name not in _active_names(connection, "classes"):
+                    raise ValueError("Choose an active class or section.")
+                if not isinstance(subject_name, str) or subject_name not in _active_names(connection, "subjects"):
+                    raise ValueError("Choose an active subject.")
+                if not isinstance(teacher_name, str):
+                    raise ValueError("Choose a valid teacher or leave the teacher automatic.")
+                if teacher_name and teacher_name not in _active_names(connection, "teachers"):
+                    raise ValueError("Choose an active teacher.")
+                counts = [data.get("lecture_count"), data.get("practical_count")]
+                block_size = data.get("practical_block_size", 2)
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 42
+                    for value in counts
+                ):
+                    raise ValueError("Weekly lecture and practical session counts must be between 0 and 42.")
+                if not sum(counts):
+                    raise ValueError("Configure at least one lecture or practical session.")
+                if (
+                    isinstance(block_size, bool)
+                    or not isinstance(block_size, int)
+                    or not 2 <= block_size <= 6
+                ):
+                    raise ValueError("Practical blocks must be 2–6 consecutive periods.")
+                requires_lab = data.get("requires_lab", True)
+                if not isinstance(requires_lab, bool):
+                    raise ValueError("Specify whether practicals require a laboratory.")
+                if teacher_name and not connection.execute(
+                    "SELECT 1 FROM teacher_expertise WHERE teacher = ? AND subject = ?",
+                    (teacher_name, subject_name),
+                ).fetchone():
+                    raise ValueError("The selected teacher is not marked as qualified for this subject.")
+                connection.execute(
+                    "INSERT INTO college_requirements "
+                    "(class_name, subject_name, teacher_name, lecture_count, practical_count, "
+                    "practical_block_size, requires_lab) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(class_name, subject_name) DO UPDATE SET "
+                    "teacher_name=excluded.teacher_name, lecture_count=excluded.lecture_count, "
+                    "practical_count=excluded.practical_count, "
+                    "practical_block_size=excluded.practical_block_size, "
+                    "requires_lab=excluded.requires_lab",
+                    (
+                        class_name,
+                        subject_name,
+                        teacher_name.strip(),
+                        counts[0],
+                        counts[1],
+                        block_size,
+                        int(requires_lab),
+                    ),
+                )
+                invalidate_schedule_validation(connection)
+                return {"ok": True}
+
+            if kind == "availability":
+                teacher_name = data.get("teacher_name")
+                unavailable = data.get("unavailable")
+                periods = data.get("periods_per_day")
+                if not isinstance(teacher_name, str) or teacher_name not in _active_names(connection, "teachers"):
+                    raise ValueError("Choose an active teacher.")
+                if isinstance(periods, bool) or not isinstance(periods, int) or not 1 <= periods <= 12:
+                    raise ValueError("Periods per day must be between 1 and 12.")
+                if not isinstance(unavailable, list) or len(unavailable) > len(WEEKDAYS) * periods:
+                    raise ValueError("Availability must be a list of unavailable day/period slots.")
+                slots: set[tuple[str, int]] = set()
+                for slot in unavailable:
+                    if (
+                        not isinstance(slot, dict)
+                        or slot.get("day") not in WEEKDAYS
+                        or isinstance(slot.get("period"), bool)
+                        or not isinstance(slot.get("period"), int)
+                        or not 1 <= slot["period"] <= periods
+                    ):
+                        raise ValueError("Unavailable slots must use Monday–Saturday and valid period numbers.")
+                    slots.add((slot["day"], slot["period"]))
+                connection.execute(
+                    "DELETE FROM teacher_unavailability WHERE teacher_name = ?",
+                    (teacher_name,),
+                )
+                connection.execute(
+                    "INSERT INTO teacher_availability_settings (teacher_name) VALUES (?) "
+                    "ON CONFLICT(teacher_name) DO NOTHING",
+                    (teacher_name,),
+                )
+                connection.executemany(
+                    "INSERT INTO teacher_unavailability (teacher_name, day, period) "
+                    "VALUES (?, ?, ?)",
+                    ((teacher_name, day, period) for day, period in sorted(
+                        slots, key=lambda item: (WEEKDAYS.index(item[0]), item[1])
+                    )),
+                )
+                invalidate_schedule_validation(connection)
+                return {"ok": True}
+
+            raise ValueError("Choose a valid college setup record type.")
+
         if path == "/api/assets":
             category = data.get("category")
             table = ASSET_TABLES.get(category)
@@ -505,6 +1521,7 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                 "ON CONFLICT(name) DO UPDATE SET is_deleted = 0",
                 (name,),
             )
+            invalidate_schedule_validation(connection)
             return {"ok": True}
 
         if path == "/api/teacher-details":
@@ -523,6 +1540,7 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                 "phone = excluded.phone, is_deleted = 0",
                 (name.strip(), email.strip(), phone.strip()),
             )
+            invalidate_schedule_validation(connection)
             return {"ok": True}
 
         if path == "/api/expertise":
@@ -550,43 +1568,151 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                 "INSERT INTO teacher_expertise (teacher, subject) VALUES (?, ?)",
                 ((teacher, subject) for subject in dict.fromkeys(subjects)),
             )
+            invalidate_schedule_validation(connection)
             return {"ok": True}
 
         if path == "/api/timetable/generate":
-            days = data.get("days")
             periods = data.get("periods_per_day")
-            if not isinstance(days, list) or not 1 <= len(days) <= 7:
-                raise ValueError("Enter 1–7 timetable days.")
-            if any(not isinstance(day, str) or not day.strip() or len(day) > 30 for day in days):
-                raise ValueError("Each day must be a valid name (max 30 characters).")
-            if len(set(days)) != len(days):
-                raise ValueError("Timetable days must be unique.")
             if not isinstance(periods, int) or isinstance(periods, bool) or not 1 <= periods <= 12:
                 raise ValueError("Periods per day must be between 1 and 12.")
-            current = fetch_state(connection)
-            schedule = generate_clash_free_timetable(
-                teachers=[teacher["name"] for teacher in current["teachers"]],
-                subjects=current["subjects"],
-                classes=current["classes"],
-                expertise=current["teacher_expertise"],
-                classrooms=current["classrooms"],
-                days=[day.strip() for day in days],
-                periods_per_day=periods,
+            start_time = data.get("start_time")
+            period_minutes = data.get("period_minutes")
+            if not isinstance(start_time, str):
+                raise ValueError("Enter the actual college day start time.")
+            if (
+                isinstance(period_minutes, bool)
+                or not isinstance(period_minutes, int)
+                or not 1 <= period_minutes <= 240
+            ):
+                raise ValueError("Period duration must be between 1 and 240 minutes.")
+            result = generate_configured_week(
+                connection, periods, start_time, period_minutes
             )
-            rows = [
-                (class_name, day, period, entry["subject"], entry["teacher"], entry["room"])
-                for day, day_data in schedule.items()
-                for class_name, periods_by_class in day_data.items()
-                for period, entry in periods_by_class.items()
-            ]
-            connection.execute("DELETE FROM timetable_entries")
-            connection.executemany(
-                "INSERT INTO timetable_entries "
-                "(class_name, day, period, subject, teacher, room) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rows,
+            return {"ok": True, **result["validation"]}
+
+        if path == "/api/college-requirements/delete":
+            class_name = data.get("class_name")
+            subject_name = data.get("subject_name")
+            if not isinstance(class_name, str) or not isinstance(subject_name, str):
+                raise ValueError("Choose the class and subject requirement to remove.")
+            cursor = connection.execute(
+                "DELETE FROM college_requirements WHERE class_name = ? AND subject_name = ?",
+                (class_name, subject_name),
             )
-            return {"ok": True, "days": len(schedule), "entries": len(rows)}
+            if cursor.rowcount == 0:
+                raise ValueError("The college requirement was not found.")
+            invalidate_schedule_validation(connection)
+            return {"ok": True}
+
+        if path == "/api/timetable/edit":
+            validated_schedule = connection.execute(
+                "SELECT value FROM app_metadata WHERE key = 'college_schedule_validated'"
+            ).fetchone()
+            if not validated_schedule or validated_schedule["value"] != "1":
+                raise ValueError("Generate a validated college-wide schedule before editing entries.")
+            day = data.get("day")
+            period = data.get("period")
+            class_name = data.get("class_name")
+            teacher_name = data.get("teacher")
+            room_name = data.get("room")
+            if day not in WEEKDAYS:
+                raise ValueError("Only Monday–Saturday timetable entries can be edited.")
+            if (
+                isinstance(period, bool)
+                or not isinstance(period, int)
+                or not 1 <= period <= 12
+            ):
+                raise ValueError("Choose a valid timetable period.")
+            if not all(isinstance(value, str) and value for value in (class_name, teacher_name, room_name)):
+                raise ValueError("Choose a class, teacher, and room.")
+            current = connection.execute(
+                "SELECT id, day, period, subject, entry_type, practical_session "
+                "FROM timetable_entries "
+                "WHERE day = ? AND period = ? AND class_name = ?",
+                (day, period, class_name),
+            ).fetchone()
+            if not current:
+                raise ValueError("The timetable entry was not found.")
+            if teacher_name not in _active_names(connection, "teachers"):
+                raise ValueError("Choose an active teacher.")
+            if not connection.execute(
+                "SELECT 1 FROM teacher_expertise WHERE teacher = ? AND subject = ?",
+                (teacher_name, current["subject"]),
+            ).fetchone():
+                raise ValueError("The selected teacher is not qualified for this subject.")
+            room = connection.execute(
+                "SELECT room_type, capacity FROM college_room_details WHERE room_name = ?",
+                (room_name,),
+            ).fetchone()
+            if not room:
+                raise ValueError("Configure the selected room's type and capacity first.")
+            active_rooms = (
+                _active_names(connection, "lab_rooms")
+                if room["room_type"] == "laboratory"
+                else _active_names(connection, "classrooms")
+            )
+            if room_name not in active_rooms:
+                raise ValueError("The selected room is no longer active.")
+            requirement = connection.execute(
+                "SELECT requires_lab FROM college_requirements "
+                "WHERE class_name = ? AND subject_name = ?",
+                (class_name, current["subject"]),
+            ).fetchone()
+            required_type = (
+                "laboratory"
+                if current["entry_type"] == "practical"
+                and requirement
+                and requirement["requires_lab"]
+                else "classroom"
+            )
+            if room["room_type"] != required_type:
+                raise ValueError(f"This entry requires a configured {required_type}.")
+            class_size = connection.execute(
+                "SELECT capacity FROM college_class_details WHERE class_name = ?",
+                (class_name,),
+            ).fetchone()
+            if not class_size or room["capacity"] < class_size["capacity"]:
+                raise ValueError("The selected room is smaller than the configured class.")
+            session = current["practical_session"]
+            if session:
+                rows = connection.execute(
+                    "SELECT id, day, period FROM timetable_entries WHERE practical_session = ?",
+                    (session,),
+                ).fetchall()
+            else:
+                rows = [current]
+            if any(row["day"] != day for row in rows):
+                raise ValueError("A practical session must stay on one day.")
+            for row in rows:
+                if connection.execute(
+                    "SELECT 1 FROM teacher_unavailability WHERE teacher_name = ? "
+                    "AND day = ? AND period = ?",
+                    (teacher_name, day, row["period"]),
+                ).fetchone():
+                    raise ValueError(
+                        f"The selected teacher is unavailable on {day} period {row['period']}."
+                    )
+            row_ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" for _ in row_ids)
+            conflict = connection.execute(
+                "SELECT day, period, class_name, teacher, room FROM timetable_entries "
+                "WHERE day = ? AND period IN ("
+                + ",".join("?" for _ in rows)
+                + ") AND (teacher = ? OR room = ?) "
+                f"AND id NOT IN ({placeholders})",
+                (day, *(row["period"] for row in rows), teacher_name, room_name, *row_ids),
+            ).fetchone()
+            if conflict:
+                raise ValueError(
+                    f"Teacher or room already booked for {conflict['class_name']} "
+                    f"on {conflict['day']} period {conflict['period']}."
+                )
+            connection.execute(
+                "UPDATE timetable_entries SET teacher = ?, room = ? WHERE id IN "
+                f"({placeholders})",
+                (teacher_name, room_name, *row_ids),
+            )
+            return {"ok": True}
 
         if path == "/api/feedback":
             teacher = data.get("teacher", "")
@@ -613,36 +1739,20 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             prompt = data.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000:
                 raise ValueError("Enter a question (max 2000 characters).")
+            language = data.get("language", "hi")
+            if not isinstance(language, str) or language not in {"hi", "en"}:
+                raise ValueError("Choose Hindi or English for the assistant reply.")
             prompt = prompt.strip()
             state = fetch_state(connection)
             schedule = state["generated_timetable"]
             if is_timetable_generation_request(prompt):
-                days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-                schedule = generate_clash_free_timetable(
-                    teachers=[teacher["name"] for teacher in state["teachers"]],
-                    subjects=state["subjects"],
-                    classes=state["classes"],
-                    expertise=state["teacher_expertise"],
-                    classrooms=state["classrooms"],
-                    days=days,
-                    periods_per_day=8,
-                )
-                rows = [
-                    (class_name, day, period, entry["subject"], entry["teacher"], entry["room"])
-                    for day, day_data in schedule.items()
-                    for class_name, periods_by_class in day_data.items()
-                    for period, entry in periods_by_class.items()
-                ]
-                connection.execute("DELETE FROM timetable_entries")
-                connection.executemany(
-                    "INSERT INTO timetable_entries "
-                    "(class_name, day, period, subject, teacher, room) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    rows,
-                )
                 answer = (
-                    f"Generated and saved a clash-free timetable for {len(days)} days, "
-                    "8 periods/day. No teacher or classroom is double-booked."
+                    "पूरा कॉलेज टाइमटेबल बनाने के लिए Generate Schedule स्क्रीन पर सभी "
+                    "क्लास, विषय-कोड, साप्ताहिक लेक्चर/प्रैक्टिकल, कमरे और उपलब्धता पहले सेट करें।"
+                    if language == "hi"
+                    else "To generate the complete college timetable, configure every class, "
+                    "subject code, weekly lecture/practical load, room, and teacher availability "
+                    "in College Setup, then use Generate Schedule."
                 )
             else:
                 answer = AI.ask(
@@ -651,9 +1761,12 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                         "teachers": [teacher["name"] for teacher in state["teachers"]],
                         "subjects": state["subjects"],
                         "classes": state["classes"],
+                        "classrooms": state["classrooms"],
+                        "labs": state["labs"],
                         "teacher_expertise": state["teacher_expertise"],
                         "generated_timetable": schedule,
                     },
+                    language=language,
                 )
             connection.executemany(
                 "INSERT INTO ai_history (role, content) VALUES (?, ?)",
@@ -717,6 +1830,7 @@ class PreviewHandler(SimpleHTTPRequestHandler):
                             HTTPStatus.NOT_FOUND,
                         )
                         return
+                    invalidate_schedule_validation(connection)
             self.respond_json({"ok": True})
         except sqlite3.Error as exc:
             print(f"Could not update asset: {exc}", file=sys.stderr)
@@ -731,8 +1845,8 @@ def main() -> None:
         raise SystemExit(f"Browser UI directory not found: {WEB_ROOT}")
     if not ADMIN_USERNAME or len(ADMIN_USERNAME) > 120:
         raise SystemExit("Set TIMETABLE_ADMIN_USERNAME to a non-empty value (max 120 characters).")
-    if not 12 <= len(ADMIN_PASSWORD) <= 256:
-        raise SystemExit("Set TIMETABLE_ADMIN_PASSWORD to 12–256 characters.")
+    if not 8 <= len(ADMIN_PASSWORD) <= 256:
+        raise SystemExit("Set TIMETABLE_ADMIN_PASSWORD to 8–256 characters.")
     if len(SESSION_SECRET) < 32:
         raise SystemExit("Set TIMETABLE_SESSION_SECRET to a random secret of at least 32 characters.")
     initialize_database()
