@@ -1,0 +1,20 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+twilio_creds.json
+
+# Local databases
+*.sqlite3
+*.sqlite
+*.db
+
