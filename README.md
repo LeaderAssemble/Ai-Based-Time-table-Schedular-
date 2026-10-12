@@ -1,70 +1,41 @@
+# AI Powered Timetable Scheduler
 
-# ⏰ AI Powered Timetable Scheduler
+## Live demo
 
-## 🌐 Live Web Demo
+Open the deployed web demo: <https://timetable-scheduler-pro.onrender.com>
 
-The hosted browser demo is configured through `render.yaml`; its source is kept
-separately in [`web-demo/`](./web-demo/), so this desktop app remains unchanged.
-Deploy it from Render using **New → Blueprint** and this GitHub repository.
-Render will prompt for `TIMETABLE_ADMIN_PASSWORD`; choose a private password of
-at least 12 characters. The session-signing secret is generated automatically.
+The hosted demo uses fictional sample data in a separate database. Do not enter real student or staff information. Render's free filesystem can reset data after a restart or redeploy.
 
-The demo uses fictional sample data and an isolated database. Do not enter real
-student or staff information. Render's free filesystem can reset data after a
-restart or redeploy. Never upload database files, API keys, or passwords.
+## Run locally
 
-## 📌 Project Overview
-The AI Powered Timetable Scheduler is a web-based application
-that automatically generates class timetables without any 
-conflicts. It uses Artificial Intelligence logic to create 
-optimized and balanced schedules for students and teachers 
-saving time and reducing manual effort.
+Clone this repository:
 
----
+```powershell
+git clone https://github.com/LeaderAssemble/Ai-Based-Time-table-Schedular-.git
+cd Ai-Based-Time-table-Schedular-
+```
 
-## 🚀 Features
-- Automatically generates conflict-free timetables
-- AI powered scheduling algorithm
-- Easy to use web interface
-- Manages multiple subjects and teachers
-- Avoids scheduling conflicts automatically
-- Saves time compared to manual timetable creation
+The Windows local web launcher is [`web-demo/run-local.bat`](./web-demo/run-local.bat). It uses the existing `timetable_db.sqlite3` database in the repository root and asks you to set a local password. Start the launcher, then open <http://127.0.0.1:8000> (also known as `http://localhost:8000`) on the same computer. This address works only while the local server is running.
 
----
+See the [web demo guide](./web-demo/README.md) for local and hosted-demo details.
 
-## 🛠️ Technologies Used
+## Project overview
+
+The AI Powered Timetable Scheduler generates and manages class timetables, helping avoid scheduling conflicts between classes, teachers, and rooms.
+
+## Features
+
+- Generates conflict-aware timetables
+- Manages subjects, teachers, classes, and rooms
+- Supports timetable history and workload analytics
+- Provides a browser-based interface and a desktop application
+
+## Technologies
+
 - Python
-- Web Framework (Flask / Django)
-- HTML
-- CSS
-- JavaScript
-- AI Scheduling Algorithm
+- HTML, CSS, and JavaScript
+- Local timetable scheduling logic
 
----
+## Author
 
-## 💻 How to Run the Project
-1. Clone the repository
-   git clone https://github.com/AniketSinghYadav/timetable-scheduler.git
-
-2. Install required dependencies
-   pip install -r requirements.txt
-
-3. Run the application
-   python app.py
-
-4. Open your browser and go to
-   http://localhost:5000
-
----
-
-## 🤖 How AI Works in This Project
-- The system takes input of subjects, teachers and time slots
-- AI algorithm automatically assigns subjects to time slots
-- It checks and avoids all possible conflicts
-- Generates the most optimized timetable automatically
-
----
-
-## 👨‍💻 Author
 Aniket Singh Yadav
-B.Tech CSIT Student
